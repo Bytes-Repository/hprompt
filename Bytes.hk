@@ -2,7 +2,7 @@
 -> name    => hprompt
 -> version => 0.1.0
 -> description => Line-editing & history for H#, in the spirit of Rust's rustyline.
--> license => MIT
+-> license => Apache-2.0
 
 [build]
 -> lang   => h#
