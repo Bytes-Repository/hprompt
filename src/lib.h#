@@ -1,1 +1,367 @@
+use "std -> io"      from "io"
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
 
+;; ── History ──────────────────────────────────────────────────────────────
+
+struct History is
+    pub entries: [string]
+    pub max_len: int
+end
+
+pub fn history_new() -> History is
+    return History { entries: [], max_len: 1000 }
+end
+
+pub fn history_with_capacity(max_len: int) -> History is
+    let cap = if max_len > 0 is max_len else 1000 end
+    return History { entries: [], max_len: cap }
+end
+
+;; Add a line to history. `added` is false (and `history` comes back
+;; unchanged) if the line is blank, or identical to the most recently
+;; added entry — mirrors rustyline's default "ignore consecutive
+;; duplicates" behavior. Oldest entries are dropped once `max_len` is
+;; exceeded.
+;;
+;; INTERPRETER QUIRK, confirmed by direct testing against this
+;; runtime: inside a `while` loop body, a plain variable mutation
+;; placed *after* an `if` whose true branch actually ran that
+;; iteration silently fails to take effect (the loop counter freezes
+;; and the loop never terminates) — `if false is ... end` is
+;; unaffected, only a taken branch triggers it. Every loop in this
+;; file that mutates a counter therefore does so *before* the `if`,
+;; carrying the pre-mutation index in a `let cur = i` local for the
+;; `if` to read — see `history_search_prefix`/`_contains` and
+;; `completer_complete` below for the pattern. `while entries.len() >
+;; h.max_len is ...` just below has no `if` in its body at all, so it
+;; isn't affected and needed no such rewrite.
+pub fn history_add(h: History, line: string) -> (History, bool) is
+    if str::trim(line).len() == 0 is return (h, false) end
+    ;; NOTE: `&&`/`||` evaluate both operands unconditionally in this
+    ;; interpreter (confirmed against `call.rs`'s `BinOp::And`/`Or` —
+    ;; there is no short-circuit), so an out-of-range index guarded by
+    ;; `len() > 0 && arr[len()-1] ...` would still evaluate `arr[-1]`
+    ;; and panic on an empty array. Nested `if`s avoid that everywhere
+    ;; in this file rather than relying on a combined boolean guard.
+    if h.entries.len() > 0 is
+        if h.entries[h.entries.len() - 1] == line is
+            return (h, false)
+        end
+    end
+    let mut entries = h.entries
+    entries.push(line)
+    while entries.len() > h.max_len is
+        entries = entries[1..entries.len()]
+    end
+    return (History { entries: entries, max_len: h.max_len }, true)
+end
+
+pub fn history_len(h: History) -> int is
+    return h.entries.len()
+end
+
+pub fn history_is_empty(h: History) -> bool is
+    return h.entries.len() == 0
+end
+
+pub fn history_clear(h: History) -> History is
+    return History { entries: [], max_len: h.max_len }
+end
+
+;; 0-based. "" if out of range (no panics — the same "honest empty
+;; default" style `col::HashMap::get` etc. already use).
+pub fn history_get(h: History, idx: int) -> string is
+    if idx < 0 || idx >= h.entries.len() is return "" end
+    return h.entries[idx]
+end
+
+pub fn history_last(h: History) -> string is
+    if h.entries.len() == 0 is return "" end
+    return h.entries[h.entries.len() - 1]
+end
+
+pub fn history_all(h: History) -> [string] is
+    return h.entries
+end
+
+;; Most-recent-first entries starting with `prefix`.
+pub fn history_search_prefix(h: History, prefix: string) -> [string] is
+    let mut out: [string] = []
+    let mut i = h.entries.len() - 1
+    ;; NOTE: the loop counter is advanced *before* the `if`, not after —
+    ;; see the long comment above `history_add` for why (a confirmed
+    ;; interpreter quirk where a mutation placed *after* an `if` whose
+    ;; true branch runs, inside a `while` body, silently fails to take
+    ;; effect on the next iteration).
+    while i >= 0 is
+        let cur = i
+        i = i - 1
+        if h.entries[cur].starts_with(prefix) is out.push(h.entries[cur]) end
+    end
+    return out
+end
+
+;; Most-recent-first entries containing `needle` anywhere.
+pub fn history_search_contains(h: History, needle: string) -> [string] is
+    let mut out: [string] = []
+    let mut i = h.entries.len() - 1
+    while i >= 0 is
+        let cur = i
+        i = i - 1
+        if h.entries[cur].contains(needle) is out.push(h.entries[cur]) end
+    end
+    return out
+end
+
+;; Bash-style expansion: `!!` -> last entry, `!N` -> entry N (1-based),
+;; `!prefix` -> most recent entry starting with `prefix`. Only fires
+;; when `!` is the very first character, so ordinary text containing
+;; "!" elsewhere (e.g. "echo hi!") passes through unchanged. Returns
+;; `input` unchanged whenever there's no match, rather than silently
+;; producing an empty command.
+pub fn history_expand(h: History, input: string) -> string is
+    if input.len() == 0 || input[0..1] != "!" is return input end
+    let rest = input[1..input.len()]
+    if rest == "!" is
+        let l = history_last(h)
+        if l == "" is return input end
+        return l
+    end
+    if str::is_numeric(rest) is
+        let idx = conv::str_to_int(rest)
+        if idx >= 1 && idx <= h.entries.len() is
+            return h.entries[idx - 1]
+        end
+        return input
+    end
+    let matches = history_search_prefix(h, rest)
+    if matches.len() > 0 is return matches[0] end
+    return input
+end
+
+;; One entry per line, oldest first — the same layout bash/rustyline
+;; use for a `.history` file.
+pub fn history_save(h: History, path: string) -> bool is
+    if h.entries.len() > 0 is
+        fs::write(path, str::join(h.entries, "\n") + "\n")
+    else is
+        fs::write(path, "")
+    end
+    return true
+end
+
+;; Appends the file's lines to whatever is already in `h` (still
+;; subject to `max_len` / dedup via `history_add`). `ok` is false if
+;; the file doesn't exist — no exception, no partial guess.
+pub fn history_load(h: History, path: string) -> (History, bool) is
+    if !fs::exists(path) is return (h, false) end
+    let lines = fs::read_lines(path)
+    let mut cur = h
+    let mut i = 0
+    while i < lines.len() is
+        let (next, _added) = history_add(cur, lines[i])
+        cur = next
+        i += 1
+    end
+    return (cur, true)
+end
+
+;; ── Completer ────────────────────────────────────────────────────────────
+;; A plain prefix-matching word list — the "static candidate list"
+;; half of rustyline's `Completer` trait. There's no live popup (see
+;; the module doc comment); matches are shown after a trailing Tab.
+
+struct Completer is
+    pub words: [string]
+end
+
+pub fn completer_new() -> Completer is
+    return Completer { words: [] }
+end
+
+pub fn completer_from_words(words: [string]) -> Completer is
+    return Completer { words: words }
+end
+
+pub fn completer_add_word(c: Completer, w: string) -> Completer is
+    let mut words = c.words
+    words.push(w)
+    return Completer { words: words }
+end
+
+;; Candidates starting with `partial`, in insertion order.
+pub fn completer_complete(c: Completer, partial: string) -> [string] is
+    let mut out: [string] = []
+    let mut i = 0
+    while i < c.words.len() is
+        let cur = i
+        i = i + 1
+        if c.words[cur].starts_with(partial) is out.push(c.words[cur]) end
+    end
+    return out
+end
+
+;; ── ReadResult ───────────────────────────────────────────────────────────
+;; A plain tagged struct rather than an enum — H#'s `match` on an
+;; enum pulled in through `use "std -> x"` is a known-incomplete path
+;; (see the module doc comment), so this sidesteps it entirely. Check
+;; `result_is_line`/`result_is_eof` and read `.line` when it's a line.
+
+struct ReadResult is
+    pub kind: string   ;; "line" | "eof"
+    pub line: string   ;; valid when kind == "line"
+end
+
+pub fn result_is_line(r: ReadResult) -> bool is
+    return r.kind == "line"
+end
+
+pub fn result_is_eof(r: ReadResult) -> bool is
+    return r.kind == "eof"
+end
+
+;; ── Editor ───────────────────────────────────────────────────────────────
+
+struct Editor is
+    pub prompt: string
+    pub history: History
+    pub completer: Completer
+    pub auto_add_history: bool
+    pub bang_history: bool
+    pub tab_complete: bool
+    pub blank_line_is_eof: bool
+end
+
+pub fn editor_new() -> Editor is
+    return Editor {
+        prompt: "> ",
+        history: history_new(),
+        completer: completer_new(),
+        auto_add_history: true,
+        bang_history: true,
+        tab_complete: false,
+        blank_line_is_eof: true,
+    }
+end
+
+pub fn editor_set_prompt(e: Editor, prompt: string) -> Editor is
+    return Editor {
+        prompt: prompt, history: e.history, completer: e.completer,
+        auto_add_history: e.auto_add_history, bang_history: e.bang_history,
+        tab_complete: e.tab_complete, blank_line_is_eof: e.blank_line_is_eof,
+    }
+end
+
+pub fn editor_set_completer(e: Editor, c: Completer) -> Editor is
+    return Editor {
+        prompt: e.prompt, history: e.history, completer: c,
+        auto_add_history: e.auto_add_history, bang_history: e.bang_history,
+        tab_complete: e.tab_complete, blank_line_is_eof: e.blank_line_is_eof,
+    }
+end
+
+pub fn editor_set_tab_complete(e: Editor, on: bool) -> Editor is
+    return Editor {
+        prompt: e.prompt, history: e.history, completer: e.completer,
+        auto_add_history: e.auto_add_history, bang_history: e.bang_history,
+        tab_complete: on, blank_line_is_eof: e.blank_line_is_eof,
+    }
+end
+
+pub fn editor_set_blank_line_is_eof(e: Editor, on: bool) -> Editor is
+    return Editor {
+        prompt: e.prompt, history: e.history, completer: e.completer,
+        auto_add_history: e.auto_add_history, bang_history: e.bang_history,
+        tab_complete: e.tab_complete, blank_line_is_eof: on,
+    }
+end
+
+pub fn editor_history_len(e: Editor) -> int is
+    return history_len(e.history)
+end
+
+pub fn editor_load_history(e: Editor, path: string) -> (Editor, bool) is
+    let (h2, ok) = history_load(e.history, path)
+    return (with_history(e, h2), ok)
+end
+
+pub fn editor_save_history(e: Editor, path: string) -> bool is
+    return history_save(e.history, path)
+end
+
+pub fn editor_clear_history(e: Editor) -> Editor is
+    return with_history(e, history_clear(e.history))
+end
+
+;; Read one line using `e.prompt`. See the module doc comment for
+;; exactly what this can/can't do vs. rustyline.
+pub fn editor_readline(e: Editor) -> (Editor, ReadResult) is
+    return editor_readline_with(e, e.prompt)
+end
+
+;; Same as `editor_readline`, but with a one-off prompt that doesn't
+;; overwrite `e.prompt`.
+pub fn editor_readline_with(e: Editor, prompt: string) -> (Editor, ReadResult) is
+    let mut raw = io::read_line(prompt)
+    let mut cur_prompt = prompt
+
+    ;; Tab-completion workflow: a trailing literal Tab byte means
+    ;; "show me completions", not "submit this line". Loops until the
+    ;; user submits something that doesn't end in Tab.
+    let mut keep_completing = e.tab_complete
+    while keep_completing is
+        keep_completing = false
+        if e.tab_complete && raw.len() > 0 is
+            if raw[raw.len() - 1..raw.len()] == "\t" is
+                let partial = raw[0..raw.len() - 1]
+                let matches = completer_complete(e.completer, partial)
+                print_matches(matches)
+                cur_prompt = prompt + partial
+                raw = io::read_line(cur_prompt)
+                keep_completing = true
+            end
+        end
+    end
+
+    if e.bang_history is
+        raw = history_expand(e.history, raw)
+    end
+
+    if raw == "" is
+        if e.blank_line_is_eof is
+            return (e, ReadResult { kind: "eof", line: "" })
+        end
+        return (e, ReadResult { kind: "line", line: "" })
+    end
+
+    if e.auto_add_history is
+        let (h2, _added) = history_add(e.history, raw)
+        return (with_history(e, h2), ReadResult { kind: "line", line: raw })
+    end
+
+    return (e, ReadResult { kind: "line", line: raw })
+end
+
+;; ── internals ────────────────────────────────────────────────────────────
+
+fn with_history(e: Editor, h: History) -> Editor is
+    return Editor {
+        prompt: e.prompt, history: h, completer: e.completer,
+        auto_add_history: e.auto_add_history, bang_history: e.bang_history,
+        tab_complete: e.tab_complete, blank_line_is_eof: e.blank_line_is_eof,
+    }
+end
+
+fn print_matches(matches: [string]) is
+    if matches.len() == 0 is
+        write("  (no matches)")
+        return
+    end
+    let mut i = 0
+    while i < matches.len() is
+        write("  " + matches[i])
+        i += 1
+    end
+end
