@@ -1,0 +1,47 @@
+use "std -> hprompt" from "hp"
+
+fn main() is
+    let mut ed = hp::editor_new()
+    ed = hp::editor_set_prompt(ed, "demo> ")
+    ed = hp::editor_set_completer(ed, hp::completer_from_words(["help", "quit", "status", "history"]))
+    ed = hp::editor_set_tab_complete(ed, true)
+    ed = hp::editor_set_blank_line_is_eof(ed, false)
+
+    write("hprompt demo — type 'quit' to exit, blank line does nothing")
+
+    while true is
+        let (e2, result) = hp::editor_readline(ed)
+        ed = e2
+
+        if hp::result_is_eof(result) is
+            write("(eof)")
+            break
+        end
+
+        let line = result.line
+
+        if line == "" is
+            ;; blank_line_is_eof is off above, so this is a real empty
+            ;; submit, not eof — just loop again
+            continue
+        end
+
+        if line == "quit" is
+            break
+        end
+
+        if line == "history" is
+            let all = hp::history_all(ed.history)
+            let mut i = 0
+            while i < all.len() is
+                write(to_string(i) + ": " + all[i])
+                i += 1
+            end
+            continue
+        end
+
+        write("you said: " + line)
+    end
+
+    write("bye!")
+end
