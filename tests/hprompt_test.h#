@@ -1,0 +1,157 @@
+use "std -> hprompt" from "hp"
+use "std -> test"    from "test"
+
+fn test_history_add_and_dedup() is
+    let mut h = hp::history_new()
+    let (h1, a1) = hp::history_add(h, "first")
+    assert_true(a1)
+    h = h1
+    let (h2, a2) = hp::history_add(h, "second")
+    assert_true(a2)
+    h = h2
+    let (h3, a3) = hp::history_add(h, "second")   ;; consecutive dup
+    assert_false(a3)
+    h = h3
+    let (h4, a4) = hp::history_add(h, "")          ;; blank
+    assert_false(a4)
+    h = h4
+    let (h5, a5) = hp::history_add(h, "   ")        ;; blank after trim
+    assert_false(a5)
+    h = h5
+    assert_eq(hp::history_len(h), 2)
+    assert_eq(hp::history_last(h), "second")
+end
+
+fn test_history_get_and_search() is
+    let mut h = hp::history_new()
+    let (h1, _) = hp::history_add(h, "git status")
+    let (h2, _) = hp::history_add(h1, "git commit -m x")
+    let (h3, _) = hp::history_add(h2, "ls -la")
+    let (h4, _) = hp::history_add(h3, "git push")
+    h = h4
+
+    assert_eq(hp::history_get(h, 0), "git status")
+    assert_eq(hp::history_get(h, 99), "")
+
+    let matches = hp::history_search_prefix(h, "git")
+    assert_eq(matches.len(), 3)
+    assert_eq(matches[0], "git push")       ;; most recent first
+    assert_eq(matches[2], "git status")
+
+    let contains_m = hp::history_search_contains(h, "-m")
+    assert_eq(contains_m.len(), 1)
+    assert_eq(contains_m[0], "git commit -m x")
+end
+
+fn test_history_expand_bang() is
+    let mut h = hp::history_new()
+    let (h1, _) = hp::history_add(h, "echo one")
+    let (h2, _) = hp::history_add(h1, "echo two")
+    let (h3, _) = hp::history_add(h2, "git status")
+    h = h3
+
+    assert_eq(hp::history_expand(h, "!!"), "git status")
+    assert_eq(hp::history_expand(h, "!1"), "echo one")
+    assert_eq(hp::history_expand(h, "!2"), "echo two")
+    assert_eq(hp::history_expand(h, "!echo"), "echo two")     ;; most recent match
+    assert_eq(hp::history_expand(h, "!999"), "!999")           ;; no match -> unchanged
+    assert_eq(hp::history_expand(h, "echo hi!"), "echo hi!")   ;; ! not first char
+end
+
+fn test_history_capacity() is
+    let mut h = hp::history_with_capacity(2)
+    let (h1, _) = hp::history_add(h, "a")
+    let (h2, _) = hp::history_add(h1, "b")
+    let (h3, _) = hp::history_add(h2, "c")
+    h = h3
+    assert_eq(hp::history_len(h), 2)
+    assert_eq(hp::history_get(h, 0), "b")
+    assert_eq(hp::history_get(h, 1), "c")
+end
+
+fn test_history_save_and_load() is
+    let mut h = hp::history_new()
+    let (h1, _) = hp::history_add(h, "alpha")
+    let (h2, _) = hp::history_add(h1, "beta")
+    let (h3, _) = hp::history_add(h2, "gamma")
+    h = h3
+    hp::history_save(h, "/tmp/hprompt_test_history.txt")
+
+    let h4 = hp::history_new()
+    let (h5, loaded) = hp::history_load(h4, "/tmp/hprompt_test_history.txt")
+    assert_true(loaded)
+    assert_eq(hp::history_len(h5), 3)
+    assert_eq(hp::history_get(h5, 0), "alpha")
+    assert_eq(hp::history_get(h5, 2), "gamma")
+
+    let missing = hp::history_new()
+    let (_h6, ok) = hp::history_load(missing, "/tmp/does_not_exist_hprompt.txt")
+    assert_false(ok)
+end
+
+fn test_completer() is
+    let mut c = hp::completer_from_words(["status", "stash", "commit", "push"])
+    let matches = hp::completer_complete(c, "st")
+    assert_eq(matches.len(), 2)
+    assert_eq(matches[0], "status")
+    assert_eq(matches[1], "stash")
+
+    c = hp::completer_add_word(c, "stage")
+    let matches2 = hp::completer_complete(c, "sta")
+    assert_eq(matches2.len(), 3)   ;; status, stash, stage
+end
+
+fn test_editor_basic_readline() is
+    let mut ed = hp::editor_new()
+    ed = hp::editor_set_prompt(ed, "hprompt> ")
+
+    let (ed1, r1) = hp::editor_readline(ed)
+    assert_true(hp::result_is_line(r1))
+    assert_eq(r1.line, "hello world")
+    ed = ed1
+    assert_eq(hp::editor_history_len(ed), 1)
+
+    ;; second line triggers bang-history expansion of the first; the
+    ;; expanded text is identical to the last entry, so the dedup rule
+    ;; means history length stays at 1 (this mirrors rustyline's own
+    ;; "ignore consecutive duplicates" default)
+    let (ed2, r2) = hp::editor_readline(ed)
+    assert_true(hp::result_is_line(r2))
+    assert_eq(r2.line, "hello world")
+    ed = ed2
+    assert_eq(hp::editor_history_len(ed), 1)
+
+    ;; blank line -> eof (default blank_line_is_eof = true)
+    let (ed3, r3) = hp::editor_readline(ed)
+    assert_true(hp::result_is_eof(r3))
+    ed = ed3
+end
+
+fn test_editor_blank_not_eof() is
+    let mut ed = hp::editor_new()
+    ed = hp::editor_set_blank_line_is_eof(ed, false)
+    let (ed1, r) = hp::editor_readline(ed)
+    assert_true(hp::result_is_line(r))
+    assert_eq(r.line, "")
+    ed = ed1
+end
+
+fn main() is
+    test_history_add_and_dedup()
+    write("ok: test_history_add_and_dedup")
+    test_history_get_and_search()
+    write("ok: test_history_get_and_search")
+    test_history_expand_bang()
+    write("ok: test_history_expand_bang")
+    test_history_capacity()
+    write("ok: test_history_capacity")
+    test_history_save_and_load()
+    write("ok: test_history_save_and_load")
+    test_completer()
+    write("ok: test_completer")
+    test_editor_basic_readline()
+    write("ok: test_editor_basic_readline")
+    test_editor_blank_not_eof()
+    write("ok: test_editor_blank_not_eof")
+    write("ALL TESTS PASSED")
+end
